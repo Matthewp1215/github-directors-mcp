@@ -1,0 +1,15 @@
+# Demo policy for the GitHub Directors MCP server.
+# The script `demo/run_demo.py` points DIRECTORS_MCP_POLICY at this file automatically.
+#
+# `github` is a public organization whose public org profile and public member
+# list work with a plain personal access token. To demo against your own org,
+# replace the entry below with your org login (and use a token that has
+# read:org, or admin:org for a full report summary).
+allowed_orgs:
+  - github
+
+# Keep write tools hidden and refused for the demo.
+read_only: true
+
+# Written by run_demo.py; you can also set DIRECTORS_MCP_AUDIT_LOG.
+audit_log: demo/audit.log

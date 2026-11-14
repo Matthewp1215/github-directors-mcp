@@ -1,0 +1,33 @@
+# GitHub Directors MCP context-firewall policy
+# Copy to policy.yaml or point DIRECTORS_MCP_POLICY at a YAML or JSON file.
+#
+# Environment variables override file values:
+#   DIRECTORS_MCP_POLICY          Path to this file (default: ./policy.yaml)
+#   DIRECTORS_MCP_ALLOWED_ORGS    Comma-separated org logins
+#   DIRECTORS_MCP_ALLOW_ALL_ORGS  true/false
+#   DIRECTORS_MCP_READ_ONLY       true/false
+#   DIRECTORS_MCP_ALLOWED_TOOLS   Comma-separated tool names
+#   DIRECTORS_MCP_DENIED_TOOLS    Comma-separated tool names
+#   DIRECTORS_MCP_AUDIT_LOG       JSON Lines audit log path
+
+# Fail closed: if allowed_orgs is empty/omitted and allow_all_orgs is false
+# (the default), every org-scoped tool call is denied and no GitHub request is made.
+allowed_orgs:
+  - example-org
+# allow_all_orgs: false
+
+# Write tools are hidden from list_tools and refused while read_only is true.
+# All built-in tools are reads today; keep this on unless you add write tools
+# and explicitly want them enabled.
+read_only: true
+
+# Optional tool-level allow/deny lists. denied_tools always wins.
+# If allowed_tools is set, only those tools are advertised and callable.
+# allowed_tools:
+#   - get_org_info
+#   - get_org_report_summary
+# denied_tools:
+#   - list_team_members
+
+# JSON Lines audit log (also configurable via DIRECTORS_MCP_AUDIT_LOG).
+audit_log: ./audit.log
