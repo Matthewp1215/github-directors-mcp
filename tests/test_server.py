@@ -3,32 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
-
 import httpx
 import pytest
 import respx
 
 import server
-
-
-@pytest.fixture
-def token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-
-
-@pytest.fixture
-async def clean_client() -> AsyncIterator[None]:
-    await server.aclose_client()
-    yield
-    await server.aclose_client()
-
-
-@pytest.fixture
-async def github_mock() -> AsyncIterator[respx.MockRouter]:
-    # Use an async context: the sync respx_mock pytest fixture deadlocks with pytest-asyncio.
-    async with respx.mock(assert_all_called=False) as router:
-        yield router
 
 
 def _payload(result: list) -> dict:
