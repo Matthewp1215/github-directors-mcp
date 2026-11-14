@@ -6,7 +6,8 @@ Custom MCP server providing organization-level tools for directors:
 - Member management
 - Team management
 
-Related to context firewall concepts: tools are read-oriented by default with clear scopes.
+Tools are read-oriented by default and enforced by a context-firewall policy
+(org allowlist, read-only mode, tool allow/deny lists, and JSON Lines audit logging).
 Requires GITHUB_TOKEN environment variable with appropriate org permissions (admin or owner for some actions).
 The token is checked when a GitHub API request is made, so the module can be imported without one.
 """
@@ -16,8 +17,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -25,13 +29,35 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from policy import (
+    Policy,
+    PolicyDenied,
+    audit_tool_call,
+    evaluate_access,
+    get_policy,
+    load_policy,
+    reset_policy,
+    set_policy,
+    tool_is_visible,
+)
+
 GITHUB_API = "https://api.github.com"
 PER_PAGE_MAX = 100
 _LINK_REL_RE = re.compile(r'rel\s*=\s*"?([^"]+)"?', re.IGNORECASE)
 
 _client: httpx.AsyncClient | None = None
+_last_http_status: int | None = None
 
 server = Server("github-directors")
+
+
+def reset_last_http_status() -> None:
+    global _last_http_status
+    _last_http_status = None
+
+
+def get_last_http_status() -> int | None:
+    return _last_http_status
 
 
 class GitHubRateLimitError(Exception):
@@ -119,6 +145,8 @@ async def github_request_raw(method: str, url: str, **kwargs: Any) -> httpx.Resp
         headers.update(extra_headers)
     client = get_client()
     resp = await client.request(method, url, headers=headers, **kwargs)
+    global _last_http_status
+    _last_http_status = resp.status_code
     _raise_for_rate_limit(resp)
     resp.raise_for_status()
     return resp
@@ -300,9 +328,95 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
+@dataclass
+class ToolSpec:
+    name: str
+    access: Literal["read", "write"]
+    definition: Tool
+    handler: Callable[[dict[str, Any]], Awaitable[list[TextContent]]] | None = None
+
+
+_TOOL_REGISTRY: dict[str, ToolSpec] = {}
+
+
+def register_tool(
+    name: str,
+    access: Literal["read", "write"],
+    definition: Tool,
+    handler: Callable[[dict[str, Any]], Awaitable[list[TextContent]]] | None = None,
+) -> None:
+    """Register a tool in the access-control registry."""
+    _TOOL_REGISTRY[name] = ToolSpec(name=name, access=access, definition=definition, handler=handler)
+
+
+def unregister_tool(name: str) -> None:
+    """Remove a tool from the registry (used by tests)."""
+    _TOOL_REGISTRY.pop(name, None)
+
+
+def get_tool_spec(name: str) -> ToolSpec | None:
+    return _TOOL_REGISTRY.get(name)
+
+
+def visible_tools(policy: Policy | None = None) -> list[Tool]:
+    """Return tool definitions that the current policy allows to be advertised."""
+    current = policy or get_policy()
     return [
+        spec.definition
+        for spec in _TOOL_REGISTRY.values()
+        if tool_is_visible(current, spec.name, spec.access)
+    ]
+
+
+async def handle_get_org_info(arguments: dict[str, Any]) -> list[TextContent]:
+    data = await github_request("GET", f"/orgs/{arguments['org']}")
+    summary = {
+        "login": data.get("login"),
+        "name": data.get("name"),
+        "description": data.get("description"),
+        "public_repos": data.get("public_repos"),
+        "followers": data.get("followers"),
+        "created_at": data.get("created_at"),
+        "two_factor_requirement_enabled": data.get("two_factor_requirement_enabled"),
+    }
+    return _json_content(summary)
+
+
+async def handle_list_org_members(arguments: dict[str, Any]) -> list[TextContent]:
+    members = await fetch_org_members(
+        arguments["org"],
+        role=arguments.get("role") or "all",
+        max_results=_optional_int(arguments.get("max_results")),
+    )
+    return _json_content({"count": len(members), "members": members})
+
+
+async def handle_list_org_teams(arguments: dict[str, Any]) -> list[TextContent]:
+    teams = await fetch_org_teams(
+        arguments["org"],
+        max_results=_optional_int(arguments.get("max_results")),
+        include_member_counts=bool(arguments.get("include_member_counts", False)),
+    )
+    return _json_content({"count": len(teams), "teams": teams})
+
+
+async def handle_list_team_members(arguments: dict[str, Any]) -> list[TextContent]:
+    members = await fetch_team_members(
+        arguments["org"],
+        arguments["team_slug"],
+        max_results=_optional_int(arguments.get("max_results")),
+    )
+    return _json_content({"count": len(members), "members": members})
+
+
+async def handle_get_org_report_summary(arguments: dict[str, Any]) -> list[TextContent]:
+    return _json_content(await fetch_org_report_summary(arguments["org"]))
+
+
+def _register_builtin_tools() -> None:
+    register_tool(
+        "get_org_info",
+        "read",
         Tool(
             name="get_org_info",
             description="Get high-level information about a GitHub organization (for directors).",
@@ -314,6 +428,11 @@ async def list_tools() -> list[Tool]:
                 "required": ["org"],
             },
         ),
+        handle_get_org_info,
+    )
+    register_tool(
+        "list_org_members",
+        "read",
         Tool(
             name="list_org_members",
             description=(
@@ -339,6 +458,11 @@ async def list_tools() -> list[Tool]:
                 "required": ["org"],
             },
         ),
+        handle_list_org_members,
+    )
+    register_tool(
+        "list_org_teams",
+        "read",
         Tool(
             name="list_org_teams",
             description=(
@@ -365,6 +489,11 @@ async def list_tools() -> list[Tool]:
                 "required": ["org"],
             },
         ),
+        handle_list_org_teams,
+    )
+    register_tool(
+        "list_team_members",
+        "read",
         Tool(
             name="list_team_members",
             description="List all members of a specific team (paginated).",
@@ -381,6 +510,11 @@ async def list_tools() -> list[Tool]:
                 "required": ["org", "team_slug"],
             },
         ),
+        handle_list_team_members,
+    )
+    register_tool(
+        "get_org_report_summary",
+        "read",
         Tool(
             name="get_org_report_summary",
             description=(
@@ -395,64 +529,76 @@ async def list_tools() -> list[Tool]:
                 "required": ["org"],
             },
         ),
-    ]
+        handle_get_org_report_summary,
+    )
+
+
+_register_builtin_tools()
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return visible_tools()
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments = arguments or {}
+    started = time.perf_counter()
+    decision = "allowed"
+    reason = "allowed"
+    outcome = "ok"
+    http_status: int | None = None
+    reset_last_http_status()
     try:
-        if name == "get_org_info":
-            data = await github_request("GET", f"/orgs/{arguments['org']}")
-            summary = {
-                "login": data.get("login"),
-                "name": data.get("name"),
-                "description": data.get("description"),
-                "public_repos": data.get("public_repos"),
-                "followers": data.get("followers"),
-                "created_at": data.get("created_at"),
-                "two_factor_requirement_enabled": data.get("two_factor_requirement_enabled"),
-            }
-            return _json_content(summary)
-
-        elif name == "list_org_members":
-            members = await fetch_org_members(
-                arguments["org"],
-                role=arguments.get("role") or "all",
-                max_results=_optional_int(arguments.get("max_results")),
-            )
-            return _json_content({"count": len(members), "members": members})
-
-        elif name == "list_org_teams":
-            teams = await fetch_org_teams(
-                arguments["org"],
-                max_results=_optional_int(arguments.get("max_results")),
-                include_member_counts=bool(arguments.get("include_member_counts", False)),
-            )
-            return _json_content({"count": len(teams), "teams": teams})
-
-        elif name == "list_team_members":
-            members = await fetch_team_members(
-                arguments["org"],
-                arguments["team_slug"],
-                max_results=_optional_int(arguments.get("max_results")),
-            )
-            return _json_content({"count": len(members), "members": members})
-
-        elif name == "get_org_report_summary":
-            return _json_content(await fetch_org_report_summary(arguments["org"]))
-
-        else:
+        spec = get_tool_spec(name)
+        access = spec.access if spec else None
+        verdict = evaluate_access(get_policy(), name, arguments, access)
+        if not verdict.allowed:
+            raise PolicyDenied(verdict.reason)
+        reason = verdict.reason
+        if not spec or spec.handler is None:
+            outcome = "error"
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
+        return await spec.handler(arguments)
+    except PolicyDenied as e:
+        decision = "denied"
+        reason = e.reason
+        outcome = "error"
+        return [TextContent(type="text", text=f"Denied: {e.reason}")]
     except GitHubRateLimitError as e:
+        outcome = "error"
+        http_status = e.status_code
         return [TextContent(type="text", text=str(e))]
     except httpx.HTTPStatusError as e:
+        outcome = "error"
+        http_status = e.response.status_code
         return [TextContent(type="text", text=f"GitHub API error: {e.response.status_code} - {e.response.text}")]
     except Exception as e:
+        outcome = "error"
         return [TextContent(type="text", text=f"Error: {str(e)}")]
+    finally:
+        if http_status is None:
+            http_status = get_last_http_status()
+        duration_ms = int(round((time.perf_counter() - started) * 1000))
+        try:
+            audit_tool_call(
+                tool=name,
+                arguments=arguments,
+                decision=decision,
+                reason=reason,
+                outcome=outcome,
+                http_status=http_status,
+                duration_ms=duration_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - audit must never break a tool call
+            import sys
+
+            print(f"Failed to write audit log: {exc}", file=sys.stderr)
 
 
 async def main():
+    set_policy(load_policy())
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
